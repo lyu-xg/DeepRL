@@ -1,0 +1,4 @@
+gym
+Keras==1.2.0
+numpy
+opencv-python
