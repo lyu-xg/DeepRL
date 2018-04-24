@@ -1,7 +1,7 @@
 import gym
 import cv2
-from replay_buffer import ReplayBuffer
 import numpy as np
+from collections import deque
 from DQN import DuelQ
 from DDQN import DeepQ
 import time
@@ -16,6 +16,54 @@ INITIAL_EPSILON = 1.0
 # Number of frames to throw into network
 NUM_FRAMES = 3
 GAME = 'SpaceInvaders-v0'
+
+
+class ReplayBuffer:
+    """Constructs a buffer object that stores the past moves
+    and samples a set of subsamples"""
+
+    def __init__(self, buffer_size):
+        self.buffer_size = buffer_size
+        self.count = 0
+        self.buffer = deque()
+
+    def add(self, s, a, r, d, s2):
+        """Add an experience to the buffer"""
+        # S represents current state, a is action,
+        # r is reward, d is whether it is the end, 
+        # and s2 is next state
+        experience = (s, a, r, d, s2)
+        if self.count < self.buffer_size:
+            self.buffer.append(experience)
+            self.count += 1
+        else:
+            self.buffer.popleft()
+            self.buffer.append(experience)
+
+    def size(self):
+        return self.count
+
+    def sample(self, batch_size):
+        """Samples a total of elements equal to batch_size from buffer
+        if buffer contains enough elements. Otherwise return all elements"""
+
+        batch = []
+
+        if self.count < batch_size:
+            batch = random.sample(self.buffer, self.count)
+        else:
+            batch = random.sample(self.buffer, batch_size)
+
+        # Maps each experience in batch in batches of states, actions, rewards
+        # and new states
+        s_batch, a_batch, r_batch, d_batch, s2_batch = list(map(np.array, list(zip(*batch))))
+
+        return s_batch, a_batch, r_batch, d_batch, s2_batch
+
+    def clear(self):
+        self.buffer.clear()
+        self.count = 0
+
 
 class Agent(object):
 

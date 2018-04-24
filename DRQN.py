@@ -15,57 +15,110 @@ NUM_ACTIONS = 6
 # Number of frames to throw into network
 # NUM_FRAMES = 3
 
-class DuelQ(object):
+class Qnetwork():
+    def __init__(self,h_size,rnn_cell,myScope):
+        #The network recieves a frame from the game, flattened into an array.
+        #It then resizes it and processes it through four convolutional layers.
+        self.scalarInput =  tf.placeholder(shape=[None,21168],dtype=tf.float32)
+        self.imageIn = tf.reshape(self.scalarInput,shape=[-1,84,84,3])
+        self.conv1 = slim.convolution2d( \
+            inputs=self.imageIn,num_outputs=32,\
+            kernel_size=[8,8],stride=[4,4],padding='VALID', \
+            biases_initializer=None,scope=myScope+'_conv1')
+        self.conv2 = slim.convolution2d( \
+            inputs=self.conv1,num_outputs=64,\
+            kernel_size=[4,4],stride=[2,2],padding='VALID', \
+            biases_initializer=None,scope=myScope+'_conv2')
+        self.conv3 = slim.convolution2d( \
+            inputs=self.conv2,num_outputs=64,\
+            kernel_size=[3,3],stride=[1,1],padding='VALID', \
+            biases_initializer=None,scope=myScope+'_conv3')
+        self.conv4 = slim.convolution2d( \
+            inputs=self.conv3,num_outputs=h_size,\
+            kernel_size=[7,7],stride=[1,1],padding='VALID', \
+            biases_initializer=None,scope=myScope+'_conv4')
+        
+        self.trainLength = tf.placeholder(dtype=tf.int32)
+        #We take the output from the final convolutional layer and send it to a recurrent layer.
+        #The input must be reshaped into [batch x trace x units] for rnn processing, 
+        #and then returned to [batch x units] when sent through the upper levles.
+        self.batch_size = tf.placeholder(dtype=tf.int32,shape=[])
+        self.convFlat = tf.reshape(slim.flatten(self.conv4),[self.batch_size,self.trainLength,h_size])
+        self.state_in = rnn_cell.zero_state(self.batch_size, tf.float32)
+        self.rnn,self.rnn_state = tf.nn.dynamic_rnn(\
+                inputs=self.convFlat,cell=rnn_cell,dtype=tf.float32,initial_state=self.state_in,scope=myScope+'_rnn')
+        self.rnn = tf.reshape(self.rnn,shape=[-1,h_size])
+        #The output from the recurrent player is then split into separate Value and Advantage streams
+        self.streamA,self.streamV = tf.split(self.rnn,2,1)
+        self.AW = tf.Variable(tf.random_normal([h_size//2,4]))
+        self.VW = tf.Variable(tf.random_normal([h_size//2,1]))
+        self.Advantage = tf.matmul(self.streamA,self.AW)
+        self.Value = tf.matmul(self.streamV,self.VW)
+        
+        self.salience = tf.gradients(self.Advantage,self.imageIn)
+        #Then combine them together to get our final Q-values.
+        self.Qout = self.Value + tf.subtract(self.Advantage,tf.reduce_mean(self.Advantage,axis=1,keep_dims=True))
+        self.predict = tf.argmax(self.Qout,1)
+        
+        #Below we obtain the loss by taking the sum of squares difference between the target and prediction Q values.
+        self.targetQ = tf.placeholder(shape=[None],dtype=tf.float32)
+        self.actions = tf.placeholder(shape=[None],dtype=tf.int32)
+        self.actions_onehot = tf.one_hot(self.actions,4,dtype=tf.float32)
+        
+        self.Q = tf.reduce_sum(tf.multiply(self.Qout, self.actions_onehot), axis=1)
+        
+        self.td_error = tf.square(self.targetQ - self.Q)
+        
+        #In order to only propogate accurate gradients through the network, we will mask the first
+        #half of the losses for each trace as per Lample & Chatlot 2016
+        self.maskA = tf.zeros([self.batch_size,self.trainLength//2])
+        self.maskB = tf.ones([self.batch_size,self.trainLength//2])
+        self.mask = tf.concat([self.maskA,self.maskB],1)
+        self.mask = tf.reshape(self.mask,[-1])
+        self.loss = tf.reduce_mean(self.td_error * self.mask)
+        
+        self.trainer = tf.train.AdamOptimizer(learning_rate=0.0001)
+        self.updateModel = self.trainer.minimize(self.loss)
+
+
+class RecurQ(object):
     """Constructs the desired deep q learning network"""
     def __init__(self):
-        self.construct_q_network()
+        cell = tf.contrib.rnn.BasicLSTMCell(num_units=h_size,state_is_tuple=True)
+        cellT = tf.contrib.rnn.BasicLSTMCell(num_units=h_size,state_is_tuple=True)
+        self.mainQN = Qnetwork(h_size,cell,'main')
+        self.targetQN = Qnetwork(h_size,cellT,'target')
 
-    def construct_q_network(self):
-        # Uses the network architecture found in DeepMind paper
-        self.model = Sequential()
-        input_layer = Input(shape = (84, 84))
-        conv1 = Convolution2D(32, 8, 8, subsample=(4, 4), activation='relu')(input_layer)
-        conv2 = Convolution2D(64, 4, 4, subsample=(2, 2), activation='relu')(conv1)
-        conv3 = Convolution2D(64, 3, 3, activation = 'relu')(conv2)
-        flatten = Flatten()(conv3)
-        lstm = LSTM(512)(flatten)
-        fc1 = Dense(512)(lstm)
-        advantage = Dense(NUM_ACTIONS)(fc1)
-        fc2 = Dense(512)(lstm)
-        value = Dense(1)(fc2)
-        policy = merge([advantage, value], mode = lambda x: x[0]-K.mean(x[0])+x[1], output_shape = (NUM_ACTIONS,))
-        # policy = Dense(NUM_ACTIONS)(merge_layer)
 
-        self.model = Model(input=[input_layer], output=[policy])
-        self.model.compile(loss='mse', optimizer=Adam())
+    def predict_movement(self, s, state, epsilon):
+        a = 0
+        if np.random.rand(1) < epsilon:
+            state = sess.run(self.mainQN.rnn_state,\
+                feed_dict={self.mainQN.scalarInput:[s],self.mainQN.trainLength:1,self.mainQN.state_in:state,self.mainQN.batch_size:1})
+            a = np.random.randint(0,NUM_ACTIONS)
+        else:
+            a, state = sess.run([self.mainQN.predict,self.mainQN.rnn_state],\
+                feed_dict={self.mainQN.scalarInput:[s],self.mainQN.trainLength:1,self.mainQN.state_in:state,self.mainQN.batch_size:1})
+            a = a[0]
+        return a, state
 
-        self.target_model = Model(input=[input_layer], output=[policy])
-        self.target_model.compile(loss='mse', optimizer=Adam())
-        print("Networks Constructed.")
-
-    def predict_movement(self, data, epsilon):
-        """Predict movement of game controler where is epsilon
-        probability randomly move."""
-        q_actions = self.model.predict(data.reshape(1, 84, 84, NUM_FRAMES), batch_size = 1)
-        opt_policy = np.argmax(q_actions)
-        rand_val = np.random.random()
-        if rand_val < epsilon:
-            opt_policy = np.random.randint(0, NUM_ACTIONS)
-        return opt_policy, q_actions[0, opt_policy]
-
-    def train(self, s_batch, a_batch, r_batch, d_batch, s2_batch, observation_num):
+    def train(self, train_batch):
         """Trains network to fit given parameters"""
-        batch_size = s_batch.shape[0]
-        targets = np.zeros((batch_size, NUM_ACTIONS))
-
-        for i in range(batch_size):
-            targets[i] = self.model.predict(s_batch[i].reshape(1, 84, 84, NUM_FRAMES), batch_size = 1)
-            fut_action = self.target_model.predict(s2_batch[i].reshape(1, 84, 84, NUM_FRAMES), batch_size = 1)
-            targets[i, a_batch[i]] = r_batch[i]
-            if d_batch[i] == False:
-                targets[i, a_batch[i]] += DISCOUNT * np.max(fut_action)
-
-        loss = self.model.train_on_batch(s_batch, targets)
+        state_train = (np.zeros([batch_size,h_size]),np.zeros([batch_size,h_size]))
+        Q1 = sess.run(self.mainQN.predict,feed_dict={\
+            self.mainQN.scalarInput:np.vstack(train_batch[:,3]),\
+            self.mainQN.trainLength:trace_length,self.mainQN.state_in:state_train,self.mainQN.batch_size:batch_size})
+        Q2 = sess.run(self.targetQN.Qout,feed_dict={\
+            self.targetQN.scalarInput:np.vstack(train_batch[:,3]),\
+            self.targetQN.trainLength:trace_length,self.targetQN.state_in:state_train,self.targetQN.batch_size:batch_size})
+        end_multiplier = -(train_batch[:,4] - 1)
+        doubleQ = Q2[range(batch_size*trace_length),Q1]
+        targetQ = train_batch[:,2] + (y*doubleQ * end_multiplier)
+        #Update the network with our target values.
+        sess.run(self.mainQN.updateModel, \
+            feed_dict={self.mainQN.scalarInput:np.vstack(train_batch[:,0]),self.mainQN.targetQ:targetQ,\
+            self.mainQN.actions:train_batch[:,1],self.mainQN.trainLength:trace_length,\
+            self.mainQN.state_in:state_train,self.mainQN.batch_size:batch_size})
 
         # Print the loss every 10 iterations.
         # if observation_num % 10 == 0:

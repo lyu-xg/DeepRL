@@ -1,3 +1,5 @@
+# some code snippet brought from github.com/yilundu/DQN-DDQN-on-Space-Invaders
+
 import numpy as np
 import random
 import keras
